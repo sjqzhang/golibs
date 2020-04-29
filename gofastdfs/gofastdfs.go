@@ -14,6 +14,7 @@ import (
 	slog "log"
 	random "math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/smtp"
@@ -36,6 +37,7 @@ import (
 	"github.com/astaxie/beego/httplib"
 	mapset "github.com/deckarep/golang-set"
 	_ "github.com/eventials/go-tus"
+	"github.com/garyburd/redigo/redis"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/nfnt/resize"
 	"github.com/radovskyb/watcher"
@@ -53,7 +55,7 @@ import (
 
 var staticHandler http.Handler
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
-var server *Server=nil
+var server *Server = nil
 var logacc log.LoggerInterface
 var FOLDERS = []string{DATA_DIR, STORE_DIR, CONF_DIR, STATIC_DIR}
 var CONST_QUEUE_SIZE = 10000
@@ -74,11 +76,14 @@ var (
 	DATA_DIR                    = DATA_DIR_NAME
 	STATIC_DIR                  = STATIC_DIR_NAME
 	LARGE_DIR_NAME              = "haystack"
+	CONST_CFG_NAME              = "cfg.json"
 	LARGE_DIR                   = STORE_DIR + "/haystack"
 	CONST_LEVELDB_FILE_NAME     = DATA_DIR + "/fileserver.db"
 	CONST_LOG_LEVELDB_FILE_NAME = DATA_DIR + "/log.db"
 	CONST_STAT_FILE_NAME        = DATA_DIR + "/stat.json"
-	CONST_CONF_FILE_NAME        = CONF_DIR + "/cfg.json"
+	CONST_CONF_FILE_NAME        = CONF_DIR + "/"+CONST_CFG_NAME
+	CONST_SERVER_CRT_FILE_NAME  = CONF_DIR + "/server.crt"
+	CONST_SERVER_KEY_FILE_NAME  = CONF_DIR + "/server.key"
 	CONST_SEARCH_FILE_NAME      = DATA_DIR + "/search.txt"
 	CONST_UPLOAD_COUNTER_KEY    = "__CONST_UPLOAD_COUNTER_KEY__"
 	logConfigStr                = `
@@ -125,6 +130,8 @@ const (
 	cfgJson                        = `{
 	"绑定端号": "端口",
 	"addr": ":8080",
+	"是否开启https": "默认不开启，如需启开启，请在conf目录中增加证书文件 server.crt 私钥 文件 server.key",
+	"enable_https": false,
 	"PeerID": "集群内唯一,请使用0-9的单字符，默认自动生成",
 	"peer_id": "%s",
 	"本主机地址": "本机http地址,默认自动生成(注意端口必须与addr中的端口一致），必段为内网，自动生成不为内网请自行修改，下同",
@@ -155,6 +162,7 @@ const (
 	"default_scene": "default",
 	"是否显示目录": "默认显示,方便调试用,上线时请关闭",
 	"show_dir": true,
+	"redis配置": "用于保存文件元信息",
 	"邮件配置": "",
 	"mail": {
 		"user": "abc@163.com",
@@ -179,6 +187,8 @@ const (
 	"enable_migrate": false,
 	"文件是否去重": "默认去重",
 	"enable_distinct_file": true,
+	"图片是否缩放": "默认是",
+	"enable_image_resize": true,
 	"是否开启跨站访问": "默认开启",
 	"enable_cross_origin": true,
 	"是否开启Google认证，实现安全的上传、下载": "默认不开启",
@@ -213,8 +223,19 @@ type Server struct {
 	lockMap        *goutil.CommonMap
 	sceneMap       *goutil.CommonMap
 	searchMap      *goutil.CommonMap
+	rp             *redis.Pool
 	curDate        string
 	host           string
+	routers        map[*regexp.Regexp]func(http.ResponseWriter, *http.Request)
+}
+type Redis struct {
+	Address        string `json:"address"`
+	Pwd            string `json:"pwd"`
+	MaxIdle        int    `json:"maxIdle"`
+	MaxActive      int    `json:"maxActive"`
+	IdleTimeout    int    `json:"idleTimeout"`
+	ConnectTimeout int    `json:"connectTimeout"`
+	DB             int    `json:"db"`
 }
 type FileInfo struct {
 	Name      string   `json:"name"`
@@ -270,6 +291,7 @@ type StatDateFileInfo struct {
 type GloablConfig struct {
 	Addr                 string   `json:"addr"`
 	Peers                []string `json:"peers"`
+	EnableHttps          bool     `json:"enable_https"`
 	Group                string   `json:"group"`
 	RenameFile           bool     `json:"rename_file"`
 	ShowDir              bool     `json:"show_dir"`
@@ -296,6 +318,7 @@ type GloablConfig struct {
 	EnableMigrate        bool     `json:"enable_migrate"`
 	EnableDistinctFile   bool     `json:"enable_distinct_file"`
 	ReadOnly             bool     `json:"read_only"`
+	EnableImageResize    bool     `json:"enable_image_resize"`
 	EnableCrossOrigin    bool     `json:"enable_cross_origin"`
 	EnableGoogleAuth     bool     `json:"enable_google_auth"`
 	AuthUrl              string   `json:"auth_url"`
@@ -316,6 +339,8 @@ type GloablConfig struct {
 	RetryCount           int      `json:"retry_count"`
 	SyncDelay            int64    `json:"sync_delay"`
 	WatchChanSize        int      `json:"watch_chan_size"`
+	Redis                Redis    `json:"redis"`
+	EnableRedis          bool     `json:"enable_redis"`
 }
 type FileInfoResult struct {
 	Name    string `json:"name"`
@@ -329,9 +354,9 @@ type FileInfoResult struct {
 func NewServer() *Server {
 	var (
 		//server *Server
-		err    error
+		err error
 	)
-	if server!=nil {
+	if server != nil {
 		return server
 	}
 	server = &Server{
@@ -346,6 +371,7 @@ func NewServer() *Server {
 		queueFileLog:   make(chan *FileLog, CONST_QUEUE_SIZE),
 		queueUpload:    make(chan WrapReqResp, 100),
 		sumMap:         goutil.NewCommonMap(365 * 3),
+		routers:        make(map[*regexp.Regexp]func(http.ResponseWriter, *http.Request)),
 	}
 
 	defaultTransport := &http.Transport{
@@ -480,6 +506,10 @@ func (this *Server) BackUpMetaDataByDate(date string) {
 		msg = fmt.Sprintf("%s\t%s\n", this.util.MD5(fileInfo.Path+"/"+name), string(iter.Value()))
 		if _, err = fileMeta.WriteString(msg); err != nil {
 			log.Error(err)
+		}
+		if Config().EnableRedis {
+			this.SaveFileInfoToRedis(fileInfo.Md5, &fileInfo)
+			this.SaveFileInfoToRedis(this.util.MD5(fileInfo.Path+"/"+name), &fileInfo)
 		}
 		msg = fmt.Sprintf("%s|%d|%d|%s\n", fileInfo.Md5, fileInfo.Size, fileInfo.TimeStamp, fileInfo.Path+"/"+name)
 		if _, err = fileLog.WriteString(msg); err != nil {
@@ -1209,7 +1239,9 @@ func (this *Server) DownloadNormalFileByURI(w http.ResponseWriter, r *http.Reque
 	}
 	fullpath, _ := this.GetFilePathFromRequest(w, r)
 	if imgWidth != 0 || imgHeight != 0 {
-		this.ResizeImage(w, fullpath, uint(imgWidth), uint(imgHeight))
+		if Config().EnableImageResize {
+			this.ResizeImage(w, fullpath, uint(imgWidth), uint(imgHeight))
+		}
 		return true, nil
 	}
 	staticHandler.ServeHTTP(w, r)
@@ -1344,11 +1376,25 @@ func (this *Server) ResizeImageByBytes(w http.ResponseWriter, data []byte, width
 }
 func (this *Server) ResizeImage(w http.ResponseWriter, fullpath string, width, height uint) {
 	var (
-		img     image.Image
-		err     error
-		imgType string
-		file    *os.File
+		img            image.Image
+		err            error
+		imgType        string
+		file           *os.File
+		smallFile      *os.File
+		resizeFileName string
+		resizePath     string
 	)
+	resizePath = path.Dir(fullpath)
+	resizeFileName = "cache_" + this.util.MD5(fmt.Sprintf("%s?w=%d&h=%d", fullpath, width, height))
+	resizePath = fmt.Sprintf("%s/%s", resizePath, resizeFileName)
+	if this.util.IsExist(resizePath) {
+		if smallFile, err = os.Open(resizePath); err != nil {
+			log.Error(err)
+		}
+		defer smallFile.Close()
+		io.Copy(w, smallFile)
+		return
+	}
 	file, err = os.Open(fullpath)
 	if err != nil {
 		log.Error(err)
@@ -1359,16 +1405,24 @@ func (this *Server) ResizeImage(w http.ResponseWriter, fullpath string, width, h
 		log.Error(err)
 		return
 	}
-	file.Close()
+	defer file.Close()
+	if smallFile, err = os.Create(resizePath); err != nil {
+		log.Error(err)
+		return
+	}
+	defer smallFile.Close()
 	img = resize.Resize(width, height, img, resize.Lanczos3)
 	if imgType == "jpg" || imgType == "jpeg" {
-		jpeg.Encode(w, img, nil)
+		jpeg.Encode(smallFile, img, nil)
 	} else if imgType == "png" {
-		png.Encode(w, img)
+		png.Encode(smallFile, img)
 	} else {
 		file.Seek(0, 0)
 		io.Copy(w, file)
+		return
 	}
+	smallFile.Seek(0, 0)
+	io.Copy(w, smallFile)
 }
 func (this *Server) GetServerURI(r *http.Request) string {
 	return fmt.Sprintf("http://%s/", r.Host)
@@ -1769,12 +1823,28 @@ func (this *Server) Sync(w http.ResponseWriter, r *http.Request) {
 func (this *Server) IsExistFromLevelDB(key string, db *leveldb.DB) (bool, error) {
 	return db.Has([]byte(key), nil)
 }
+func (this *Server) redisDo(action string, args ...interface{}) (reply interface{}, err error) {
+	c := this.rp.Get()
+	defer c.Close()
+	return c.Do(action, args...)
+}
 func (this *Server) GetFileInfoFromLevelDB(key string) (*FileInfo, error) {
 	var (
 		err      error
 		data     []byte
 		fileInfo FileInfo
+		fiJson   string
 	)
+	if Config().EnableRedis {
+		if fiJson, err = redis.String(this.redisDo("GET", key)); err != nil {
+			return nil, err
+		} else {
+			if err = json.Unmarshal([]byte(fiJson), &fileInfo); err != nil {
+				return nil, err
+			}
+			return &fileInfo, nil
+		}
+	}
 	if data, err = this.ldb.Get([]byte(key), nil); err != nil {
 		return nil, err
 	}
@@ -1816,6 +1886,19 @@ func (this *Server) RemoveKeyFromLevelDB(key string, db *leveldb.DB) error {
 	err = db.Delete([]byte(key), nil)
 	return err
 }
+func (this *Server) SaveFileInfoToRedis(key string, fileInfo *FileInfo) (*FileInfo, error) {
+	var (
+		err  error
+		data []byte
+	)
+	if data, err = json.Marshal(fileInfo); err != nil {
+		return fileInfo, err
+	}
+	if _, err = this.redisDo("SET", key, string(data)); err != nil {
+		return nil, err
+	}
+	return fileInfo, nil
+}
 func (this *Server) SaveFileInfoToLevelDB(key string, fileInfo *FileInfo, db *leveldb.DB) (*FileInfo, error) {
 	var (
 		err  error
@@ -1835,6 +1918,11 @@ func (this *Server) SaveFileInfoToLevelDB(key string, fileInfo *FileInfo, db *le
 		logKey := fmt.Sprintf("%s_%s_%s", logDate, CONST_FILE_Md5_FILE_NAME, fileInfo.Md5)
 		this.logDB.Put([]byte(logKey), data, nil)
 	}
+	if Config().EnableRedis && db == this.ldb {
+		if _, err = this.redisDo("SET", key, string(data)); err != nil {
+			log.Error(err)
+		}
+	}
 	return fileInfo, nil
 }
 func (this *Server) IsPeer(r *http.Request) bool {
@@ -1842,20 +1930,54 @@ func (this *Server) IsPeer(r *http.Request) bool {
 		ip    string
 		peer  string
 		bflag bool
+		cidr  *net.IPNet
+		err   error
 	)
+	IsPublicIP := func(IP net.IP) bool {
+		if IP.IsLoopback() || IP.IsLinkLocalMulticast() || IP.IsLinkLocalUnicast() {
+			return false
+		}
+		if ip4 := IP.To4(); ip4 != nil {
+			switch true {
+			case ip4[0] == 10:
+				return false
+			case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
+				return false
+			case ip4[0] == 192 && ip4[1] == 168:
+				return false
+			default:
+				return true
+			}
+		}
+		return false
+	}
 	//return true
+	ip = this.util.GetClientIp(r)
 	if this.util.Contains("0.0.0.0", Config().AdminIps) {
+		if IsPublicIP(net.ParseIP(ip)) {
+			return false
+		}
 		return true
 	}
-	ip = this.util.GetClientIp(r)
+	if this.util.Contains(ip, Config().AdminIps) {
+		return true
+	}
+	for _, v := range Config().AdminIps {
+		if strings.Contains(v, "/") {
+			if _, cidr, err = net.ParseCIDR(v); err != nil {
+				log.Error(err)
+				return false
+			}
+			if cidr.Contains(net.ParseIP(ip)) {
+				return true
+			}
+		}
+	}
 	realIp := os.Getenv("GO_FASTDFS_IP")
 	if realIp == "" {
 		realIp = this.util.GetPulicIP()
 	}
 	if ip == "127.0.0.1" || ip == realIp {
-		return true
-	}
-	if this.util.Contains(ip, Config().AdminIps) {
 		return true
 	}
 	ip = "http://" + ip
@@ -2012,10 +2134,11 @@ func (this *Server) SyncFileInfo(w http.ResponseWriter, r *http.Request) {
 		filename    string
 	)
 	r.ParseForm()
+	fileInfoStr = r.FormValue("fileInfo")
 	if !this.IsPeer(r) {
+		log.Info("isn't peer fileInfo:", fileInfo)
 		return
 	}
-	fileInfoStr = r.FormValue("fileInfo")
 	if err = json.Unmarshal([]byte(fileInfoStr), &fileInfo); err != nil {
 		w.Write([]byte(this.GetClusterNotPermitMessage(r)))
 		log.Error(err)
@@ -2183,22 +2306,28 @@ func (this *Server) BuildFileResult(fileInfo *FileInfo, r *http.Request) FileRes
 		downloadUrl string
 		domain      string
 		host        string
+		protocol    string
 	)
+	if Config().EnableHttps {
+		protocol = "https"
+	} else {
+		protocol = "http"
+	}
 	host = strings.Replace(Config().Host, "http://", "", -1)
 	if r != nil {
 		host = r.Host
 	}
 	if !strings.HasPrefix(Config().DownloadDomain, "http") {
 		if Config().DownloadDomain == "" {
-			Config().DownloadDomain = fmt.Sprintf("http://%s", host)
+			Config().DownloadDomain = fmt.Sprintf("%s://%s", protocol, host)
 		} else {
-			Config().DownloadDomain = fmt.Sprintf("http://%s", Config().DownloadDomain)
+			Config().DownloadDomain = fmt.Sprintf("%s://%s", protocol, Config().DownloadDomain)
 		}
 	}
 	if Config().DownloadDomain != "" {
 		domain = Config().DownloadDomain
 	} else {
-		domain = fmt.Sprintf("http://%s", host)
+		domain = fmt.Sprintf("%s://%s", protocol, host)
 	}
 	outname = fileInfo.Name
 	if fileInfo.ReName != "" {
@@ -2210,7 +2339,7 @@ func (this *Server) BuildFileResult(fileInfo *FileInfo, r *http.Request) FileRes
 	} else {
 		p = p + "/" + outname
 	}
-	downloadUrl = fmt.Sprintf("http://%s/%s", host, p)
+	downloadUrl = fmt.Sprintf("%s://%s/%s", protocol, host, p)
 	if Config().DownloadDomain != "" {
 		downloadUrl = fmt.Sprintf("%s/%s", Config().DownloadDomain, p)
 	}
@@ -2239,7 +2368,6 @@ func (this *Server) SaveUploadFile(file multipart.File, header *multipart.FileHe
 	if len(Config().Extensions) > 0 && !this.util.Contains(path.Ext(fileInfo.Name), Config().Extensions) {
 		return fileInfo, errors.New("(error)file extension mismatch")
 	}
-
 	if Config().RenameFile {
 		fileInfo.ReName = this.util.MD5(this.util.GetUUID()) + path.Ext(fileInfo.Name)
 	}
@@ -2292,6 +2420,7 @@ func (this *Server) SaveUploadFile(file multipart.File, header *multipart.FileHe
 	}
 	if fi, err = outFile.Stat(); err != nil {
 		log.Error(err)
+		return fileInfo, errors.New("(error)fail," + err.Error())
 	} else {
 		fileInfo.Size = fi.Size()
 	}
@@ -2330,23 +2459,29 @@ func (this *Server) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fn = folder + "/" + this.util.GetUUID()
-	defer func() {
-		os.Remove(fn)
-	}()
+
 	fpTmp, err = os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0777)
 	if err != nil {
 		log.Error(err)
 		w.Write([]byte(err.Error()))
 		return
 	}
-	defer fpTmp.Close()
 	if _, err = io.Copy(fpTmp, r.Body); err != nil {
 		log.Error(err)
 		w.Write([]byte(err.Error()))
 		return
 	}
-	fpBody, err = os.Open(fn)
+	fpTmp.Close()
+	if fpBody, err = os.Open(fn); err != nil {
+		log.Error(err)
+		w.Write([]byte(err.Error()))
+		return
+	}
 	r.Body = fpBody
+	defer func() {
+		fpBody.Close()
+		os.Remove(fn)
+	}()
 	done := make(chan bool, 1)
 	this.queueUpload <- WrapReqResp{&w, r, done}
 	<-done
@@ -3697,7 +3832,7 @@ func init() {
 	}
 	appDir, e1 := filepath.Abs(filepath.Dir(os.Args[0]))
 	curDir, e2 := filepath.Abs(".")
-	if e1 == nil && e2 == nil && appDir != curDir {
+	if e1 == nil && e2 == nil && appDir != curDir && !strings.Contains(appDir, "go-build") {
 		msg := fmt.Sprintf("please change directory to '%s' start fileserver\n", appDir)
 		msg = msg + fmt.Sprintf("请切换到 '%s' 目录启动 fileserver ", appDir)
 		log.Warn(msg)
@@ -3720,7 +3855,9 @@ func init() {
 	CONST_LEVELDB_FILE_NAME = DATA_DIR + "/fileserver.db"
 	CONST_LOG_LEVELDB_FILE_NAME = DATA_DIR + "/log.db"
 	CONST_STAT_FILE_NAME = DATA_DIR + "/stat.json"
-	CONST_CONF_FILE_NAME = CONF_DIR + "/cfg.json"
+	CONST_CONF_FILE_NAME = CONF_DIR + "/"+CONST_CFG_NAME
+	CONST_SERVER_CRT_FILE_NAME = CONF_DIR + "/server.crt"
+	CONST_SERVER_KEY_FILE_NAME = CONF_DIR + "/server.key"
 	CONST_SEARCH_FILE_NAME = DATA_DIR + "/search.txt"
 	FOLDERS = []string{DATA_DIR, STORE_DIR, CONF_DIR, STATIC_DIR}
 	logAccessConfigStr = strings.Replace(logAccessConfigStr, "{DOCKER_DIR}", DOCKER_DIR, -1)
@@ -4124,6 +4261,60 @@ func (this *Server) FormatStatInfo() {
 		this.RepairStatByDate(this.util.GetToDay())
 	}
 }
+
+func (this *Server) initRedis() *redis.Pool {
+
+	pool := &redis.Pool{
+		MaxIdle:     Config().Redis.MaxIdle,
+		MaxActive:   Config().Redis.MaxActive,
+		IdleTimeout: time.Duration(Config().Redis.IdleTimeout) * time.Second,
+		Wait:        true,
+		Dial: func() (redis.Conn, error) {
+			conn, err := redis.Dial("tcp", Config().Redis.Address,
+				redis.DialConnectTimeout(time.Duration(Config().Redis.ConnectTimeout)*time.Second),
+				redis.DialPassword(Config().Redis.Pwd),
+				redis.DialDatabase(Config().Redis.DB),
+			)
+			if err != nil {
+				fmt.Println(err)
+				log.Error(err)
+			}
+			return conn, err
+
+		},
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("ping")
+			if err != nil {
+				log.Error(err)
+				return err
+			}
+			return err
+		},
+	}
+	return pool
+}
+func (this *Server) Routing(w http.ResponseWriter, r *http.Request) {
+	realPath := r.URL.Path
+	for re, service := range this.routers {
+		if m := re.FindStringSubmatch(realPath); m != nil {
+			//p := re.String()
+			//if strings.Index(p, STATIC_DIR_NAME) != -1 {
+			//	p = p[0 : strings.LastIndex(p, "/")+1]
+			//	p = strings.Replace(realPath, p, "", 1) //realPath /group1/static/uppy.html
+			//	if b, e := Asset(p); e == nil {         // p uppy.html
+			//		w.Write(b)
+			//		return
+			//	}
+			//}
+			service(w, r)
+			return
+		}
+	}
+	this.Download(w, r)
+}
+func (this *Server) RegisterRouting(pattern *regexp.Regexp, handler func(http.ResponseWriter, *http.Request)) {
+	this.routers[pattern] = handler
+}
 func (this *Server) initComponent(isReload bool) {
 	var (
 		ip string
@@ -4168,6 +4359,9 @@ func (this *Server) initComponent(isReload bool) {
 		if len(kv) == 2 {
 			this.sceneMap.Put(kv[0], kv[1])
 		}
+	}
+	if Config().EnableRedis {
+		this.rp = this.initRedis()
 	}
 	if Config().ReadTimeout == 0 {
 		Config().ReadTimeout = 60 * 10
@@ -4275,10 +4469,8 @@ func (this *Server) Start() {
 	}()
 	uploadPage := "upload.html"
 	if groupRoute == "" {
-		http.HandleFunc(fmt.Sprintf("%s", "/"), this.Download)
 		http.HandleFunc(fmt.Sprintf("/%s", uploadPage), this.Index)
 	} else {
-		http.HandleFunc(fmt.Sprintf("%s", "/"), this.Download)
 		http.HandleFunc(fmt.Sprintf("%s", groupRoute), this.Download)
 		http.HandleFunc(fmt.Sprintf("%s/%s", groupRoute, uploadPage), this.Index)
 	}
@@ -4304,17 +4496,26 @@ func (this *Server) Start() {
 	http.HandleFunc(fmt.Sprintf("%s/receive_md5s", groupRoute), this.ReceiveMd5s)
 	http.HandleFunc(fmt.Sprintf("%s/gen_google_secret", groupRoute), this.GenGoogleSecret)
 	http.HandleFunc(fmt.Sprintf("%s/gen_google_code", groupRoute), this.GenGoogleCode)
+	http.HandleFunc(fmt.Sprintf("%s", "/"), this.Routing) //default handler
+	http.Handle(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.StripPrefix(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.FileServer(http.Dir(STATIC_DIR_NAME))))
+	//server.RegisterRouting(regexp.MustCompile(fmt.Sprintf("%s/%s/.*", groupRoute, STATIC_DIR_NAME)), http.FileServer(http.Dir(STATIC_DIR_NAME)).ServeHTTP)
 	http.HandleFunc("/"+Config().Group+"/", this.Download)
 	fmt.Println("Listen on " + Config().Addr)
-	srv := &http.Server{
-		Addr:              Config().Addr,
-		Handler:           new(HttpHandler),
-		ReadTimeout:       time.Duration(Config().ReadTimeout) * time.Second,
-		ReadHeaderTimeout: time.Duration(Config().ReadHeaderTimeout) * time.Second,
-		WriteTimeout:      time.Duration(Config().WriteTimeout) * time.Second,
-		IdleTimeout:       time.Duration(Config().IdleTimeout) * time.Second,
+	if Config().EnableHttps {
+		err := http.ListenAndServeTLS(Config().Addr, CONST_SERVER_CRT_FILE_NAME, CONST_SERVER_KEY_FILE_NAME, new(HttpHandler))
+		log.Error(err)
+		fmt.Println(err)
+	} else {
+		srv := &http.Server{
+			Addr:              Config().Addr,
+			Handler:           new(HttpHandler),
+			ReadTimeout:       time.Duration(Config().ReadTimeout) * time.Second,
+			ReadHeaderTimeout: time.Duration(Config().ReadHeaderTimeout) * time.Second,
+			WriteTimeout:      time.Duration(Config().WriteTimeout) * time.Second,
+			IdleTimeout:       time.Duration(Config().IdleTimeout) * time.Second,
+		}
+		err := srv.ListenAndServe()
+		log.Error(err)
+		fmt.Println(err)
 	}
-	err := srv.ListenAndServe()
-	log.Error(err)
-	fmt.Println(err)
 }
