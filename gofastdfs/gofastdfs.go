@@ -59,6 +59,7 @@ var server *Server = nil
 var logacc log.LoggerInterface
 var FOLDERS = []string{DATA_DIR, STORE_DIR, CONF_DIR, STATIC_DIR}
 var CONST_QUEUE_SIZE = 10000
+var mux *http.ServeMux
 var (
 	VERSION     string
 	BUILD_TIME  string
@@ -373,7 +374,7 @@ func NewServer() *Server {
 		sumMap:         goutil.NewCommonMap(365 * 3),
 		routers:        make(map[*regexp.Regexp]func(http.ResponseWriter, *http.Request)),
 	}
-
+	mux=http.NewServeMux()
 	defaultTransport := &http.Transport{
 		DisableKeepAlives:   true,
 		Dial:                httplib.TimeoutDialer(time.Second*15, time.Second*300),
@@ -3832,7 +3833,7 @@ func init() {
 	}
 	appDir, e1 := filepath.Abs(filepath.Dir(os.Args[0]))
 	curDir, e2 := filepath.Abs(".")
-	if e1 == nil && e2 == nil && appDir != curDir && !strings.Contains(appDir, "go-build") {
+	if e1 == nil && e2 == nil && appDir != curDir && !strings.Contains(appDir, "go_build") && !strings.Contains(appDir, "GoLand"){
 		msg := fmt.Sprintf("please change directory to '%s' start fileserver\n", appDir)
 		msg = msg + fmt.Sprintf("请切换到 '%s' 目录启动 fileserver ", appDir)
 		log.Warn(msg)
@@ -4422,9 +4423,10 @@ func (HttpHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	if Config().EnableCrossOrigin {
 		server.CrossOrigin(res, req)
 	}
-	http.DefaultServeMux.ServeHTTP(res, req)
+	mux.ServeHTTP(res,req)
+	//http.DefaultServeMux.ServeHTTP(res, req)
 }
-func (this *Server) Start() {
+func (this *Server) Start(addr string) {
 	go func() {
 		for {
 			this.CheckFileAndSendToPeer(this.util.GetToDay(), CONST_Md5_ERROR_FILE_NAME, false)
@@ -4443,6 +4445,9 @@ func (this *Server) Start() {
 	go this.RemoveDownloading()
 	if Config().EnableFsnotify {
 		go this.WatchFilesChange()
+	}
+	if addr=="" {
+		addr=Config().Addr
 	}
 	//go this.LoadSearchDict()
 	if Config().EnableMigrate {
@@ -4467,47 +4472,48 @@ func (this *Server) Start() {
 			debug.FreeOSMemory()
 		}
 	}()
+
 	uploadPage := "upload.html"
 	if groupRoute == "" {
-		http.HandleFunc(fmt.Sprintf("/%s", uploadPage), this.Index)
+		mux.HandleFunc(fmt.Sprintf("/%s", uploadPage), this.Index)
 	} else {
-		http.HandleFunc(fmt.Sprintf("%s", groupRoute), this.Download)
-		http.HandleFunc(fmt.Sprintf("%s/%s", groupRoute, uploadPage), this.Index)
+		mux.HandleFunc(fmt.Sprintf("%s", groupRoute), this.Download)
+		mux.HandleFunc(fmt.Sprintf("%s/%s", groupRoute, uploadPage), this.Index)
 	}
-	http.HandleFunc(fmt.Sprintf("%s/check_files_exist", groupRoute), this.CheckFilesExist)
-	http.HandleFunc(fmt.Sprintf("%s/check_file_exist", groupRoute), this.CheckFileExist)
-	http.HandleFunc(fmt.Sprintf("%s/upload", groupRoute), this.Upload)
-	http.HandleFunc(fmt.Sprintf("%s/delete", groupRoute), this.RemoveFile)
-	http.HandleFunc(fmt.Sprintf("%s/get_file_info", groupRoute), this.GetFileInfo)
-	http.HandleFunc(fmt.Sprintf("%s/sync", groupRoute), this.Sync)
-	http.HandleFunc(fmt.Sprintf("%s/stat", groupRoute), this.Stat)
-	http.HandleFunc(fmt.Sprintf("%s/repair_stat", groupRoute), this.RepairStatWeb)
-	http.HandleFunc(fmt.Sprintf("%s/status", groupRoute), this.Status)
-	http.HandleFunc(fmt.Sprintf("%s/repair", groupRoute), this.Repair)
-	http.HandleFunc(fmt.Sprintf("%s/report", groupRoute), this.Report)
-	http.HandleFunc(fmt.Sprintf("%s/backup", groupRoute), this.BackUp)
-	http.HandleFunc(fmt.Sprintf("%s/search", groupRoute), this.Search)
-	http.HandleFunc(fmt.Sprintf("%s/list_dir", groupRoute), this.ListDir)
-	http.HandleFunc(fmt.Sprintf("%s/remove_empty_dir", groupRoute), this.RemoveEmptyDir)
-	http.HandleFunc(fmt.Sprintf("%s/repair_fileinfo", groupRoute), this.RepairFileInfo)
-	http.HandleFunc(fmt.Sprintf("%s/reload", groupRoute), this.Reload)
-	http.HandleFunc(fmt.Sprintf("%s/syncfile_info", groupRoute), this.SyncFileInfo)
-	http.HandleFunc(fmt.Sprintf("%s/get_md5s_by_date", groupRoute), this.GetMd5sForWeb)
-	http.HandleFunc(fmt.Sprintf("%s/receive_md5s", groupRoute), this.ReceiveMd5s)
-	http.HandleFunc(fmt.Sprintf("%s/gen_google_secret", groupRoute), this.GenGoogleSecret)
-	http.HandleFunc(fmt.Sprintf("%s/gen_google_code", groupRoute), this.GenGoogleCode)
-	http.HandleFunc(fmt.Sprintf("%s", "/"), this.Routing) //default handler
-	http.Handle(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.StripPrefix(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.FileServer(http.Dir(STATIC_DIR_NAME))))
+	mux.HandleFunc(fmt.Sprintf("%s/check_files_exist", groupRoute), this.CheckFilesExist)
+	mux.HandleFunc(fmt.Sprintf("%s/check_file_exist", groupRoute), this.CheckFileExist)
+	mux.HandleFunc(fmt.Sprintf("%s/upload", groupRoute), this.Upload)
+	mux.HandleFunc(fmt.Sprintf("%s/delete", groupRoute), this.RemoveFile)
+	mux.HandleFunc(fmt.Sprintf("%s/get_file_info", groupRoute), this.GetFileInfo)
+	mux.HandleFunc(fmt.Sprintf("%s/sync", groupRoute), this.Sync)
+	mux.HandleFunc(fmt.Sprintf("%s/stat", groupRoute), this.Stat)
+	mux.HandleFunc(fmt.Sprintf("%s/repair_stat", groupRoute), this.RepairStatWeb)
+	mux.HandleFunc(fmt.Sprintf("%s/status", groupRoute), this.Status)
+	mux.HandleFunc(fmt.Sprintf("%s/repair", groupRoute), this.Repair)
+	mux.HandleFunc(fmt.Sprintf("%s/report", groupRoute), this.Report)
+	mux.HandleFunc(fmt.Sprintf("%s/backup", groupRoute), this.BackUp)
+	mux.HandleFunc(fmt.Sprintf("%s/search", groupRoute), this.Search)
+	mux.HandleFunc(fmt.Sprintf("%s/list_dir", groupRoute), this.ListDir)
+	mux.HandleFunc(fmt.Sprintf("%s/remove_empty_dir", groupRoute), this.RemoveEmptyDir)
+	mux.HandleFunc(fmt.Sprintf("%s/repair_fileinfo", groupRoute), this.RepairFileInfo)
+	mux.HandleFunc(fmt.Sprintf("%s/reload", groupRoute), this.Reload)
+	mux.HandleFunc(fmt.Sprintf("%s/syncfile_info", groupRoute), this.SyncFileInfo)
+	mux.HandleFunc(fmt.Sprintf("%s/get_md5s_by_date", groupRoute), this.GetMd5sForWeb)
+	mux.HandleFunc(fmt.Sprintf("%s/receive_md5s", groupRoute), this.ReceiveMd5s)
+	mux.HandleFunc(fmt.Sprintf("%s/gen_google_secret", groupRoute), this.GenGoogleSecret)
+	mux.HandleFunc(fmt.Sprintf("%s/gen_google_code", groupRoute), this.GenGoogleCode)
+	mux.HandleFunc(fmt.Sprintf("%s", "/"), this.Routing) //default handler
+	mux.Handle(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.StripPrefix(fmt.Sprintf("%s/%s/", groupRoute, STATIC_DIR_NAME), http.FileServer(http.Dir(STATIC_DIR_NAME))))
 	//server.RegisterRouting(regexp.MustCompile(fmt.Sprintf("%s/%s/.*", groupRoute, STATIC_DIR_NAME)), http.FileServer(http.Dir(STATIC_DIR_NAME)).ServeHTTP)
-	http.HandleFunc("/"+Config().Group+"/", this.Download)
-	fmt.Println("Listen on " + Config().Addr)
+	mux.HandleFunc("/"+Config().Group+"/", this.Download)
+	fmt.Println("Listen on " + addr)
 	if Config().EnableHttps {
 		err := http.ListenAndServeTLS(Config().Addr, CONST_SERVER_CRT_FILE_NAME, CONST_SERVER_KEY_FILE_NAME, new(HttpHandler))
 		log.Error(err)
 		fmt.Println(err)
 	} else {
 		srv := &http.Server{
-			Addr:              Config().Addr,
+			Addr:              addr,
 			Handler:           new(HttpHandler),
 			ReadTimeout:       time.Duration(Config().ReadTimeout) * time.Second,
 			ReadHeaderTimeout: time.Duration(Config().ReadHeaderTimeout) * time.Second,
