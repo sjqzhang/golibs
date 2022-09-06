@@ -1,17 +1,16 @@
 package work_weixin
 
-
 import (
-"bytes"
-"encoding/json"
-"errors"
-"fmt"
-"io"
-"io/ioutil"
-"log"
-"net/http"
-"os"
-"time"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"time"
 )
 
 type WorkWeixin struct {
@@ -276,7 +275,7 @@ func (w *WorkWeixin) GetAccessToken() string {
 		log.Print("重新通过网络获取")
 		url := fmt.Sprintf("https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=%s&corpsecret=%s", w.corpid, w.corpsecret)
 		buffer, err = GetRequestUrl(url)
-		log.Println(url,string(buffer))
+		log.Println(url, string(buffer))
 	} else {
 		w.token = token
 		return w.token.Access_token
@@ -332,7 +331,7 @@ func (w *WorkWeixin) saveAccessToken(bytes []byte) {
 		os.Remove(w.getStoreFile())
 		return
 	}
-	file, err := os.OpenFile(w.getStoreFile(),os.O_RDWR|os.O_CREATE|os.O_TRUNC,0666) // For read access.
+	file, err := os.OpenFile(w.getStoreFile(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666) // For read access.
 	if err != nil {
 		log.Println(err)
 		return

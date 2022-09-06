@@ -82,7 +82,7 @@ var (
 	CONST_LEVELDB_FILE_NAME     = DATA_DIR + "/fileserver.db"
 	CONST_LOG_LEVELDB_FILE_NAME = DATA_DIR + "/log.db"
 	CONST_STAT_FILE_NAME        = DATA_DIR + "/stat.json"
-	CONST_CONF_FILE_NAME        = CONF_DIR + "/"+CONST_CFG_NAME
+	CONST_CONF_FILE_NAME        = CONF_DIR + "/" + CONST_CFG_NAME
 	CONST_SERVER_CRT_FILE_NAME  = CONF_DIR + "/server.crt"
 	CONST_SERVER_KEY_FILE_NAME  = CONF_DIR + "/server.key"
 	CONST_SEARCH_FILE_NAME      = DATA_DIR + "/search.txt"
@@ -374,7 +374,7 @@ func NewServer() *Server {
 		sumMap:         goutil.NewCommonMap(365 * 3),
 		routers:        make(map[*regexp.Regexp]func(http.ResponseWriter, *http.Request)),
 	}
-	mux=http.NewServeMux()
+	mux = http.NewServeMux()
 	defaultTransport := &http.Transport{
 		DisableKeepAlives:   true,
 		Dial:                httplib.TimeoutDialer(time.Second*15, time.Second*300),
@@ -3833,7 +3833,7 @@ func init() {
 	}
 	appDir, e1 := filepath.Abs(filepath.Dir(os.Args[0]))
 	curDir, e2 := filepath.Abs(".")
-	if e1 == nil && e2 == nil && appDir != curDir && !strings.Contains(appDir, "go_build") && !strings.Contains(appDir, "GoLand"){
+	if e1 == nil && e2 == nil && appDir != curDir && !strings.Contains(appDir, "go_build") && !strings.Contains(appDir, "GoLand") {
 		msg := fmt.Sprintf("please change directory to '%s' start fileserver\n", appDir)
 		msg = msg + fmt.Sprintf("请切换到 '%s' 目录启动 fileserver ", appDir)
 		log.Warn(msg)
@@ -3856,7 +3856,7 @@ func init() {
 	CONST_LEVELDB_FILE_NAME = DATA_DIR + "/fileserver.db"
 	CONST_LOG_LEVELDB_FILE_NAME = DATA_DIR + "/log.db"
 	CONST_STAT_FILE_NAME = DATA_DIR + "/stat.json"
-	CONST_CONF_FILE_NAME = CONF_DIR + "/"+CONST_CFG_NAME
+	CONST_CONF_FILE_NAME = CONF_DIR + "/" + CONST_CFG_NAME
 	CONST_SERVER_CRT_FILE_NAME = CONF_DIR + "/server.crt"
 	CONST_SERVER_KEY_FILE_NAME = CONF_DIR + "/server.key"
 	CONST_SEARCH_FILE_NAME = DATA_DIR + "/search.txt"
@@ -4423,7 +4423,7 @@ func (HttpHandler) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 	if Config().EnableCrossOrigin {
 		server.CrossOrigin(res, req)
 	}
-	mux.ServeHTTP(res,req)
+	mux.ServeHTTP(res, req)
 	//http.DefaultServeMux.ServeHTTP(res, req)
 }
 func (this *Server) Start(addr string) {
@@ -4446,8 +4446,8 @@ func (this *Server) Start(addr string) {
 	if Config().EnableFsnotify {
 		go this.WatchFilesChange()
 	}
-	if addr=="" {
-		addr=Config().Addr
+	if addr == "" {
+		addr = Config().Addr
 	}
 	//go this.LoadSearchDict()
 	if Config().EnableMigrate {
